@@ -43,13 +43,30 @@ load(
     "shell",
 )
 
-def _codesign_command_for_path(ctx, path_to_sign, provisioning_profile, entitlements_file):
+def _double_quote(raw_string):
+    """Add double quotes around the string and preserve existing quote characters.
+
+    Args:
+      raw_string: A string that might have shell-syntaxed environment variables.
+
+    Returns:
+      The string with double quotes.
+    """
+    return "\"" + raw_string.replace("\"", "\\\"") + "\""
+
+def _codesign_command_for_path(
+        ctx,
+        path_to_sign,
+        signed_paths,
+        provisioning_profile,
+        entitlements_file):
     """Returns a single `codesign` command invocation.
 
     Args:
       ctx: The Skylark context.
       path_to_sign: A struct indicating the path that should be signed and its
           optionality (see `_path_to_sign`).
+      signed_paths: List of file system paths for files that have already been signed.
       provisioning_profile: The provisioning profile file. May be `None`.
       entitlements_file: The entitlements file to pass to codesign. May be `None`
           for non-app binaries (e.g. test bundles).
@@ -57,16 +74,6 @@ def _codesign_command_for_path(ctx, path_to_sign, provisioning_profile, entitlem
     Returns:
       The codesign command invocation for the given directory.
     """
-
-    # Because the path will include environment variables which need to be expanded, path has to be
-    # quoted using double quote, this means that path can't be quoted using shell.quote.
-    path = "\"" + path_to_sign.path.replace("\"", "\\\"") + "\""
-    if path_to_sign.glob:
-        # The glob must be appended outside of the quotes in order to be expanded.
-        full_path_to_sign = path + path_to_sign.glob
-    else:
-        full_path_to_sign = path
-
     cmd_codesigning = [
         ctx.executable._codesigningtool.path,
         "--codesign",
@@ -98,31 +105,39 @@ def _codesign_command_for_path(ctx, path_to_sign, provisioning_profile, entitlem
             ])
         cmd_codesigning.extend([
             "--force",
-            full_path_to_sign,
         ])
     else:
         cmd_codesigning.extend([
             "--force",
             "--timestamp=none",
-            full_path_to_sign,
         ])
 
-    final_command = " ".join(cmd_codesigning)
+    # Because the path does include environment variables which need to be expanded, path has to be
+    # quoted using double quotes, this means that path can't be quoted using shell.quote.
+    cmd_codesigning.extend([
+        "--full_path_to_sign",
+        _double_quote(path_to_sign.path),
+    ])
 
-    # If the path is optional, wrap it inside an `if` that checks whether that path exists. This way
-    # the command will not return a non-zero exit code if the directory not exists.
-    if path_to_sign.optional:
-        final_command = "if [[ -e {path_to_sign} ]]; then\n  {codesign_command}\nfi".format(
-            path_to_sign = path,
-            codesign_command = final_command,
-        )
+    if path_to_sign.is_directory:
+        cmd_codesigning.extend([
+            "--is_directory",
+        ])
+
+    if signed_paths:
+        # Signed paths must also be double quoted, as they too have an environment variable to be
+        # expanded.
+        cmd_codesigning.append("--signed_paths")
+        cmd_codesigning.extend([_double_quote(p) for p in signed_paths])
+
+    final_command = " ".join(cmd_codesigning)
 
     # The command returned by this function is executed as part of the final bundling shell script.
     # Each directory to be signed must be prefixed by $WORK_DIR, which is the variable in that
     # script that contains the path to the directory where the bundle is being built.
     return final_command
 
-def _path_to_sign(path, optional = False, glob = None, use_entitlements = True):
+def _path_to_sign(path, is_directory = False, use_entitlements = True):
     """Returns a "path to sign" value to be passed to `_signing_command_lines`.
 
     Args:
@@ -131,11 +146,9 @@ def _path_to_sign(path, optional = False, glob = None, use_entitlements = True):
           prefixed with a `$WORK_DIR` environment variable that points to the
           location where the bundle is being constructed, but for simple binary
           signing it is the path to the binary itself.
-      optional: If `True`, the path is an optional path that is ignored if it does
-          not exist. This is used to handle Frameworks directories cleanly since
-          they may or may not be present in the bundle.
-      glob: If provided, this is a glob string to append to the path when calling
-          the signing tool.
+      is_directory: If `True`, the path is a directory and not a bundle, indicating
+          that the contents of each item in the directory should be code signed
+          except for the invisible files prefixed with a period.
       use_entitlements: If provided, indicates if the entitlements on the bundling
           target should be used for signing this path (useful to disabled the use
           when signing frameworks within an iOS app).
@@ -145,14 +158,14 @@ def _path_to_sign(path, optional = False, glob = None, use_entitlements = True):
     """
     return struct(
         path = path,
-        optional = optional,
-        glob = glob,
+        is_directory = is_directory,
         use_entitlements = use_entitlements,
     )
 
 def _signing_command_lines(
         ctx,
         paths_to_sign,
+        signed_paths,
         entitlements_file):
     """Returns a multi-line string with codesign invocations for the bundle.
 
@@ -164,6 +177,7 @@ def _signing_command_lines(
       ctx: The Skylark context.
       paths_to_sign: A list of values returned from `path_to_sign` that indicate
           paths that should be code-signed.
+      signed_paths: File system paths for files that have already been signed.
       entitlements_file: The entitlements file to pass to codesign.
 
     Returns:
@@ -199,6 +213,7 @@ def _signing_command_lines(
         commands.append(_codesign_command_for_path(
             ctx,
             path_to_sign,
+            signed_paths,
             provisioning_profile,
             entitlements_file,
         ))
@@ -228,13 +243,15 @@ def _should_sign_simulator_bundles(ctx):
         True,
     )
 
-def _codesigning_command(ctx, entitlements, frameworks_path, bundle_path = ""):
+def _codesigning_command(ctx, entitlements, frameworks_path, signed_paths, bundle_path = ""):
     """Returns a codesigning command that includes framework embedded bundles.
 
     Args:
         ctx: The rule context.
         entitlements: The entitlements file to sign with. Can be None.
         frameworks_path: The location of the Frameworks directory, relative to the archive.
+        signed_paths: A depset containing the location of each framework path that has already
+            been signed, relative to the archive.
         bundle_path: The location of the bundle, relative to the archive.
 
     Returns:
@@ -242,15 +259,39 @@ def _codesigning_command(ctx, entitlements, frameworks_path, bundle_path = ""):
     """
     rule_descriptor = rule_support.rule_descriptor(ctx)
     signing_command_lines = ""
-    if not rule_descriptor.skip_signing:
-        paths_to_sign = [
-            _path_to_sign(
-                paths.join("$WORK_DIR", frameworks_path) + "/",
-                optional = True,
-                glob = "*",
-                use_entitlements = False,
-            ),
-        ]
+    codesigning_exceptions = rule_descriptor.codesigning_exceptions
+    should_sign_bundles = True
+
+    if (codesigning_exceptions ==
+        rule_support.codesigning_exceptions.sign_with_provisioning_profile):
+        # If the rule doesn't have a provisioning profile, do not sign the binary or its
+        # frameworks. In that case, we return an empty string.
+        provisioning_profile = getattr(ctx.file, "provisioning_profile", None)
+        if not provisioning_profile:
+            should_sign_bundles = False
+    elif codesigning_exceptions == rule_support.codesigning_exceptions.skip_signing:
+        should_sign_bundles = False
+    elif codesigning_exceptions != rule_support.codesigning_exceptions.none:
+        fail("Internal error, encountered unsupported state for codesigning_exceptions.")
+
+    if should_sign_bundles:
+        paths_to_sign = []
+        full_signed_paths = []
+
+        # Prefix the signed paths with an environment variable representing their expected
+        # location in bazel-out.
+        for signed_path in signed_paths.to_list():
+            full_signed_paths.append(paths.join("$WORK_DIR", signed_path))
+
+        if frameworks_path:
+            paths_to_sign.append(
+                _path_to_sign(
+                    paths.join("$WORK_DIR", frameworks_path) + "/",
+                    is_directory = True,
+                    use_entitlements = False,
+                ),
+            )
+
         is_device = platform_support.is_device_build(ctx)
         if is_device or _should_sign_simulator_bundles(ctx):
             paths_to_sign.append(
@@ -259,6 +300,7 @@ def _codesigning_command(ctx, entitlements, frameworks_path, bundle_path = ""):
         signing_command_lines = _signing_command_lines(
             ctx,
             paths_to_sign,
+            full_signed_paths,
             entitlements,
         )
 
@@ -268,6 +310,7 @@ def _post_process_and_sign_archive_action(
         ctx,
         archive_codesigning_path,
         frameworks_path,
+        signed_paths,
         input_archive,
         output_archive,
         output_archive_root_path,
@@ -278,6 +321,8 @@ def _post_process_and_sign_archive_action(
       ctx: The target's rule context.
       archive_codesigning_path: The codesigning path relative to the archive.
       frameworks_path: The Frameworks path relative to the archive.
+      signed_paths: Depset containing the location of each framework path that has already been
+          signed, relative to the archive.
       input_archive: The `File` representing the archive containing the bundle
           that has not yet been processed or signed.
       output_archive: The `File` representing the processed and signed archive.
@@ -298,6 +343,7 @@ def _post_process_and_sign_archive_action(
         ctx,
         entitlements,
         frameworks_path,
+        signed_paths,
         bundle_path = archive_codesigning_path,
     )
 
@@ -367,6 +413,7 @@ def _sign_binary_action(ctx, input_binary, output_binary):
     signing_commands = _signing_command_lines(
         ctx,
         [path_to_sign],
+        None,
         None,
     )
 

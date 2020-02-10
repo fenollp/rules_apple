@@ -44,6 +44,9 @@ the packaging bundle. Only applicable for iOS applications.""",
         "xpc_services": """
 A depset with the zipped archives of bundles that need to be expanded into the XPCServices section
 of the packaging bundle. Only applicable for macOS applications.""",
+        "code_signed_paths": """
+A depset of strings referencing paths that have already been codesigned, typically by embedded
+bundles.""",
     },
 )
 
@@ -51,6 +54,7 @@ def _embedded_bundles_partial_impl(
         ctx,
         bundle_embedded_bundles,
         embeddable_targets,
+        code_signed_paths,
         **input_bundles_by_type):
     """Implementation for the embedded bundles processing partial."""
     _ignore = [ctx]
@@ -121,6 +125,31 @@ def _embedded_bundles_partial_impl(
     else:
         partial_output_fields["bundle_zips"] = bundles_to_embed
 
+    # Construct a transitive depset of signed paths, indicating files that we expect to have
+    # already been code signed by past targets.
+    transitive_signed_path_depsets = []
+
+    # See if any code_signed_paths have been propagated.
+    for provider in embeddable_providers:
+        if hasattr(provider, "code_signed_paths"):
+            transitive_signed_path_depsets.append(provider.code_signed_paths)
+
+    if transitive_signed_path_depsets:
+        # Output the existing, propagated code_signed_paths as an output of this partial.
+        #
+        # NOTE: We avoid passing this target's additional depset of code_signed_paths to the code
+        # signing phase to avoid suggesting to this target's code signing phase that files that
+        # will be code signed in this target have already been code signed.
+        partial_output_fields["signed_paths"] = depset(transitive = transitive_signed_path_depsets)
+
+        # Propagate the full set of signed paths upstream as the provider output.
+        embeddedable_info_fields["code_signed_paths"] = depset(
+            transitive = [code_signed_paths] + transitive_signed_path_depsets,
+        )
+    else:
+        # If no transitive signed paths were found, pass code_signed_paths.
+        embeddedable_info_fields["code_signed_paths"] = code_signed_paths
+
     return struct(
         providers = [_AppleEmbeddableInfo(**embeddedable_info_fields)],
         **partial_output_fields
@@ -129,6 +158,7 @@ def _embedded_bundles_partial_impl(
 def embedded_bundles_partial(
         bundle_embedded_bundles = False,
         embeddable_targets = [],
+        code_signed_paths = depset(),
         frameworks = [],
         plugins = [],
         watch_bundles = [],
@@ -146,6 +176,8 @@ def embedded_bundles_partial(
             embeddable bundles will be propagated downstream for a top level target to bundle them.
         embeddable_targets: The list of targets that propagate embeddable bundles to bundle or
             propagate.
+        code_signed_paths: A depset of strings referencing paths that have already been codesigned,
+            typically by embedded bundles.
         frameworks: List of framework bundles that should be propagated downstream for a top level
             target to bundle inside `Frameworks`.
         plugins: List of plugin bundles that should be propagated downstream for a top level
@@ -162,6 +194,7 @@ def embedded_bundles_partial(
         _embedded_bundles_partial_impl,
         bundle_embedded_bundles = bundle_embedded_bundles,
         embeddable_targets = embeddable_targets,
+        code_signed_paths = code_signed_paths,
         frameworks = frameworks,
         plugins = plugins,
         watch_bundles = watch_bundles,

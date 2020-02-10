@@ -36,6 +36,8 @@ All partials handled by this processor must follow this API:
     * output_groups: Dictionary of output group names to depset of Files that should be returned in
       the OutputGroupInfo provider.
     * providers: Providers that will be collected and returned by the rule.
+    * signed_paths: Depset of file system paths for frameworks which were already signed during the
+      bundling phase.
 
 Location types can be 7:
   - archive: Files are to be placed relative to the archive of the bundle
@@ -394,6 +396,11 @@ def _bundle_post_process_and_sign(ctx, partial_outputs, output_archive):
     """
     archive_paths = _archive_paths(ctx)
     entitlements = entitlements_support.entitlements(ctx)
+    signed_paths_depsets = []
+    for partial_output in partial_outputs:
+        if hasattr(partial_output, "signed_paths"):
+            signed_paths_depsets.append(partial_output.signed_paths)
+    transitive_signed_paths = depset(transitive = signed_paths_depsets)
 
     if is_experimental_tree_artifact_enabled(ctx):
         extra_input_files = []
@@ -405,10 +412,12 @@ def _bundle_post_process_and_sign(ctx, partial_outputs, output_archive):
         if provisioning_profile:
             extra_input_files.append(provisioning_profile)
 
+        # TODO(b/149874635): Don't pass frameworks_path unless the rule has it (ios_application).
         codesigning_command = codesigning_support.codesigning_command(
             ctx,
             entitlements = entitlements,
             frameworks_path = archive_paths[_LOCATION_ENUM.framework],
+            signed_paths = transitive_signed_paths,
         )
 
         _bundle_partial_outputs_files(
@@ -437,10 +446,13 @@ def _bundle_post_process_and_sign(ctx, partial_outputs, output_archive):
         frameworks_path = archive_paths[_LOCATION_ENUM.framework]
 
         output_archive_root_path = outputs.archive_root_path(ctx)
+
+        # TODO(b/149874635): Don't pass frameworks_path unless the rule has it (ios_application).
         codesigning_support.post_process_and_sign_archive_action(
             ctx,
             archive_codesigning_path,
             frameworks_path,
+            transitive_signed_paths,
             unprocessed_archive,
             output_archive,
             output_archive_root_path,
